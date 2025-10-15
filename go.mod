@@ -17,4 +17,4 @@ require (
 	go.bytecodealliance.org/cm v0.3.0 // indirect
 )
 
-replace github.com/jlaffaye/ftp => ./vendor/ftp
+replace github.com/jlaffaye/ftp => ./internal/ftp
