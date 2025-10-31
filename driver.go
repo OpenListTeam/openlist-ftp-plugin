@@ -203,24 +203,12 @@ func (d *FTP) LinkRange(ctx context.Context, file drivertypes.Object, args drive
 	defer d.linkConnPoll.ReturnObject(ctx, poll)
 
 	path := encode(file.Path, d.Encoding)
-	size := file.Size
-	resp, err := poll.(*ftp.ServerConn).RetrFrom(path, uint64(_range.Offset))
+	resp, err := poll.(*ftp.ServerConn).RetrFrom(path, _range.Offset)
 	if err != nil {
 		return err
 	}
 
-	if _range.Size.None() {
-		bufferSize := min(size, 1<<19)
-		_, err = io.CopyBuffer(w, resp, make([]byte, bufferSize))
-	} else {
-		length := int64(_range.Size.Value())
-		if length < 0 || int64(_range.Offset)+length > size {
-			length = size - int64(_range.Offset)
-		}
-		bufferSize := min(length, 1<<19)
-		_, err = io.CopyBuffer(w, io.LimitReader(resp, length), make([]byte, bufferSize))
-	}
-
+	_, err = io.Copy(w, io.LimitReader(resp, int64(_range.Size)))
 	return err
 }
 
