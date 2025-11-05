@@ -13,6 +13,19 @@ import (
 )
 
 // do others that not defined in Driver interface
+func (d *FTP) login() (err error) {
+	if d.conn != nil {
+		err = d.conn.NoOp()
+		if err != nil {
+			d.conn.Quit()
+			d.conn = nil
+		}
+	}
+	if d.conn == nil {
+		d.conn, err = d._login(d.ctx)
+	}
+	return err
+}
 
 func (d *FTP) _login(ctx context.Context) (*ftp.ServerConn, error) {
 	conn, err := ftp.Dial(d.Address, ftp.DialWithDialFunc(func(network, address string) (net.Conn, error) {

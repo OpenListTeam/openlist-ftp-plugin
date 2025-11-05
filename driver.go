@@ -10,8 +10,6 @@ import (
 	"github.com/OpenListTeam/openlist-wasi-plugin-driver/adapter"
 	drivertypes "github.com/OpenListTeam/openlist-wasi-plugin-driver/binding/openlist/plugin-driver/types"
 	"github.com/jlaffaye/ftp"
-
-	pool "github.com/jolestar/go-commons-pool/v2"
 )
 
 var _ openlistwasiplugindriver.Driver = (*FTP)(nil)
@@ -32,8 +30,7 @@ type FTP struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	commmonConnPoll *pool.ObjectPool
-	linkConnPoll    *pool.ObjectPool
+	conn *ftp.ServerConn
 }
 
 func (*FTP) GetProperties() drivertypes.DriverProps {
@@ -97,78 +94,21 @@ func (d *FTP) Init(ctx context.Context) error {
 		return err
 	}
 	d.ctx, d.cancel = context.WithCancel(context.Background())
-
-	if conn, err := d._login(ctx); err != nil {
-		return err
-	} else {
-		_ = conn
-		conn.Quit()
-	}
-
-	factory := func() pool.PooledObjectFactory {
-		return pool.NewPooledObjectFactory(
-			func(context.Context) (any, error) {
-				return d._login(d.ctx)
-			}, func(ctx context.Context, object *pool.PooledObject) error {
-				openlistwasiplugindriver.Debugln("FTP: PooledObjectFactory destroy")
-				ftpConn := object.Object.(*ftp.ServerConn)
-				err := ftpConn.Quit()
-				return err
-			}, func(ctx context.Context, object *pool.PooledObject) bool {
-				ftpConn := object.Object.(*ftp.ServerConn)
-				keep := ftpConn.NoOp() == nil
-				openlistwasiplugindriver.Debugln("FTP: PooledObjectFactory validate keep:", keep)
-				return keep
-			}, nil, nil)
-	}
-	if d.commmonConnPoll == nil {
-		config := pool.NewDefaultPoolConfig()
-		config.MaxTotal = 10             // 最大连接数
-		config.MaxIdle = 5               // 最大空闲连接数
-		config.MinIdle = 2               // 最小空闲连接数
-		config.TestOnBorrow = true       // 在借用时验证连接的有效性
-		config.BlockWhenExhausted = true // 当池耗尽时，让新的请求等待，而不是立即失败
-		if d.GeneralPoolSize > 0 {
-			config.MaxTotal = d.GeneralPoolSize
-			config.MaxIdle = max(d.GeneralPoolSize/2, 1)
-		}
-		d.commmonConnPoll = pool.NewObjectPool(ctx, factory(), config)
-	}
-	if d.linkConnPoll == nil {
-		config := pool.NewDefaultPoolConfig()
-		config.MaxTotal = 10             // 最大连接数
-		config.MaxIdle = 5               // 最大空闲连接数
-		config.MinIdle = 2               // 最小空闲连接数
-		config.TestOnBorrow = true       // 在借用时验证连接的有效性
-		config.BlockWhenExhausted = true // 当池耗尽时，让新的请求等待，而不是立即失败
-		if d.DownloadPoolSize > 0 {
-			config.MaxTotal = d.GeneralPoolSize
-			config.MaxIdle = max(d.GeneralPoolSize/2, 1)
-		}
-		d.linkConnPoll = pool.NewObjectPool(ctx, factory(), config)
-	}
-	return nil
+	return d.login()
 }
 
 func (d *FTP) Drop(ctx context.Context) error {
-	if d.commmonConnPoll != nil {
-		d.commmonConnPoll.Close(ctx)
-	}
-	if d.linkConnPoll != nil {
-		d.linkConnPoll.Close(ctx)
-	}
+	d.conn.Quit()
 	d.cancel()
 	return nil
 }
 
 func (d *FTP) ListFiles(ctx context.Context, dir drivertypes.Object) ([]drivertypes.Object, error) {
-	poll, err := d.commmonConnPoll.BorrowObject(ctx)
-	if err != nil {
+	if err := d.login(); err != nil {
 		return nil, err
 	}
-	defer d.commmonConnPoll.ReturnObject(ctx, poll)
 
-	entries, err := poll.(*ftp.ServerConn).List(encode(dir.Path, d.Encoding))
+	entries, err := d.conn.List(encode(dir.Path, d.Encoding))
 	if err != nil {
 		return nil, err
 	}
@@ -189,21 +129,22 @@ func (d *FTP) ListFiles(ctx context.Context, dir drivertypes.Object) ([]driverty
 }
 
 func (d *FTP) LinkFile(ctx context.Context, file drivertypes.Object, args drivertypes.LinkArgs) (*drivertypes.LinkResource, *drivertypes.Object, error) {
+	if err := d.login(); err != nil {
+		return nil, nil, err
+	}
+
 	link := drivertypes.LinkResourceRangeReader()
 	return &link, nil, nil
 }
 
 func (d *FTP) LinkRange(ctx context.Context, file drivertypes.Object, args drivertypes.LinkArgs, _range drivertypes.RangeSpec, w io.WriteCloser) error {
 	defer w.Close()
-
-	poll, err := d.linkConnPoll.BorrowObject(ctx)
-	if err != nil {
+	if err := d.login(); err != nil {
 		return err
 	}
-	defer d.linkConnPoll.ReturnObject(ctx, poll)
 
 	path := encode(file.Path, d.Encoding)
-	resp, err := poll.(*ftp.ServerConn).RetrFrom(path, _range.Offset)
+	resp, err := d.conn.RetrFrom(path, _range.Offset)
 	if err != nil {
 		return err
 	}
@@ -213,13 +154,11 @@ func (d *FTP) LinkRange(ctx context.Context, file drivertypes.Object, args drive
 }
 
 func (d *FTP) MakeDir(ctx context.Context, parentDir drivertypes.Object, dirName string) (*drivertypes.Object, error) {
-	poll, err := d.commmonConnPoll.BorrowObject(ctx)
-	if err != nil {
+	if err := d.login(); err != nil {
 		return nil, err
 	}
-	defer d.commmonConnPoll.ReturnObject(ctx, poll)
 
-	err = poll.(*ftp.ServerConn).MakeDir(encode(path.Join(parentDir.Path, dirName), d.Encoding))
+	err := d.conn.MakeDir(encode(path.Join(parentDir.Path, dirName), d.Encoding))
 	if err != nil {
 		return nil, err
 	}
@@ -231,13 +170,10 @@ func (d *FTP) MakeDir(ctx context.Context, parentDir drivertypes.Object, dirName
 }
 
 func (d *FTP) Move(ctx context.Context, srcObj, dstDir drivertypes.Object) (*drivertypes.Object, error) {
-	poll, err := d.commmonConnPoll.BorrowObject(ctx)
-	if err != nil {
+	if err := d.login(); err != nil {
 		return nil, err
 	}
-	defer d.commmonConnPoll.ReturnObject(ctx, poll)
-
-	err = poll.(*ftp.ServerConn).Rename(
+	err := d.conn.Rename(
 		encode(srcObj.Path, d.Encoding),
 		encode(path.Join(dstDir.Path, srcObj.Name), d.Encoding),
 	)
@@ -248,13 +184,10 @@ func (d *FTP) Move(ctx context.Context, srcObj, dstDir drivertypes.Object) (*dri
 }
 
 func (d *FTP) Rename(ctx context.Context, srcObj drivertypes.Object, newName string) (*drivertypes.Object, error) {
-	poll, err := d.commmonConnPoll.BorrowObject(ctx)
-	if err != nil {
+	if err := d.login(); err != nil {
 		return nil, err
 	}
-	defer d.commmonConnPoll.ReturnObject(ctx, poll)
-
-	err = poll.(*ftp.ServerConn).Rename(
+	err := d.conn.Rename(
 		encode(srcObj.Path, d.Encoding),
 		encode(path.Join(path.Dir(srcObj.Path), newName), d.Encoding),
 	)
@@ -270,26 +203,21 @@ func (d *FTP) Copy(ctx context.Context, srcObj, dstDir drivertypes.Object) (*dri
 }
 
 func (d *FTP) Remove(ctx context.Context, obj drivertypes.Object) error {
-	poll, err := d.commmonConnPoll.BorrowObject(ctx)
-	if err != nil {
+	if err := d.login(); err != nil {
 		return err
 	}
-	defer d.commmonConnPoll.ReturnObject(ctx, poll)
-
 	path := encode(obj.Path, d.Encoding)
 	if obj.IsFolder {
-		return poll.(*ftp.ServerConn).RemoveDirRecur(path)
+		return d.conn.RemoveDirRecur(path)
 	} else {
-		return poll.(*ftp.ServerConn).Delete(path)
+		return d.conn.Delete(path)
 	}
 }
 
 func (d *FTP) Put(ctx context.Context, dstDir drivertypes.Object, file adapter.UploadRequest) (*drivertypes.Object, error) {
-	poll, err := d.commmonConnPoll.BorrowObject(ctx)
-	if err != nil {
+	if err := d.login(); err != nil {
 		return nil, err
 	}
-	defer d.commmonConnPoll.ReturnObject(ctx, poll)
 
 	path := path.Join(dstDir.Path, file.Object.Name)
 	stream, err := file.Streams()
@@ -298,7 +226,7 @@ func (d *FTP) Put(ctx context.Context, dstDir drivertypes.Object, file adapter.U
 	}
 	defer stream.Close()
 
-	if err := poll.(*ftp.ServerConn).Stor(encode(path, d.Encoding), stream); err != nil {
+	if err := d.conn.Stor(encode(path, d.Encoding), stream); err != nil {
 		return nil, err
 	}
 

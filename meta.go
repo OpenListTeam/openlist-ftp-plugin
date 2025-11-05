@@ -86,7 +86,5 @@ var config = drivertypes.DriverProps{
 }
 
 func init() {
-	openlistwasiplugindriver.CreateDriver = func() openlistwasiplugindriver.Driver {
-		return &FTP{}
-	}
+	openlistwasiplugindriver.RegisterDriver(&FTP{})
 }
